@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package discoverychain
 
@@ -8,14 +8,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mitchellh/hashstructure"
-	"github.com/mitchellh/mapstructure"
-
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/configentry"
 	"github.com/hashicorp/consul/agent/connect"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/proto/private/pbpeering"
+	"github.com/mitchellh/hashstructure"
 )
 
 type CompileRequest struct {
@@ -244,19 +242,11 @@ func (c *compiler) recordServiceProtocol(sid structs.ServiceID) error {
 		return c.recordProtocol(sid, serviceDefault.Protocol)
 	}
 	if proxyDefault := c.entries.GetProxyDefaults(sid.PartitionOrDefault()); proxyDefault != nil {
-		var cfg proxyConfig
-		// Ignore errors and fallback on defaults if it does happen.
-		_ = mapstructure.WeakDecode(proxyDefault.Config, &cfg)
-		if cfg.Protocol != "" {
-			return c.recordProtocol(sid, cfg.Protocol)
+		if proxyDefault.Protocol != "" {
+			return c.recordProtocol(sid, proxyDefault.Protocol)
 		}
 	}
 	return c.recordProtocol(sid, "")
-}
-
-// proxyConfig is a snippet from agent/xds/config.go:ProxyConfig
-type proxyConfig struct {
-	Protocol string `mapstructure:"protocol"`
 }
 
 func (c *compiler) recordProtocol(fromService structs.ServiceID, protocol string) error {
@@ -1009,19 +999,25 @@ RESOLVE_AGAIN:
 		Type: structs.DiscoveryGraphNodeTypeResolver,
 		Name: target.ID,
 		Resolver: &structs.DiscoveryResolver{
-			Default:              resolver.IsDefault(),
-			Target:               target.ID,
-			ConnectTimeout:       connectTimeout,
-			RequestTimeout:       resolver.RequestTimeout,
-			PrioritizeByLocality: resolver.PrioritizeByLocality.ToDiscovery(),
+			Default:        resolver.IsDefault(),
+			Target:         target.ID,
+			ConnectTimeout: connectTimeout,
+			RequestTimeout: resolver.RequestTimeout,
 		},
 		LoadBalancer: resolver.LoadBalancer,
 	}
 
-	// Merge default values from the proxy defaults
 	proxyDefault := c.entries.GetProxyDefaults(targetID.PartitionOrDefault())
-	if proxyDefault != nil && node.Resolver.PrioritizeByLocality == nil {
-		node.Resolver.PrioritizeByLocality = proxyDefault.PrioritizeByLocality.ToDiscovery()
+
+	// Only set PrioritizeByLocality for targets in the same partition.
+	if target.Partition == c.evaluateInPartition && target.Peer == "" {
+		if resolver.PrioritizeByLocality != nil {
+			target.PrioritizeByLocality = resolver.PrioritizeByLocality.ToDiscovery()
+		}
+
+		if target.PrioritizeByLocality == nil && proxyDefault != nil {
+			target.PrioritizeByLocality = proxyDefault.PrioritizeByLocality.ToDiscovery()
+		}
 	}
 
 	target.Subset = resolver.Subsets[target.ServiceSubset]

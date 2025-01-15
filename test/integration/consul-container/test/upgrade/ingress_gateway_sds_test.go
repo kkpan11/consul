@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package upgrade
 
@@ -151,7 +151,14 @@ func TestIngressGateway_SDS_UpgradeToTarget_fromLatest(t *testing.T) {
 {
   "name": "%s",
   "connect_timeout": "5s",
-  "http2_protocol_options": {},
+  "typed_extension_protocol_options": {
+    "envoy.extensions.upstreams.http.v3.HttpProtocolOptions": {
+	  "@type": "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions",
+	  "explicit_http_config": {
+	    "http2_protocol_options": {}
+	  }
+    }
+  },
   "type": "LOGICAL_DNS",
   "load_assignment": {
     "cluster_name": "%s",

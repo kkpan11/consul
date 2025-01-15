@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package consul
 
@@ -550,18 +550,24 @@ func (s *Intention) List(args *structs.IntentionListRequest, reply *structs.Inde
 			} else {
 				reply.DataOrigin = structs.IntentionDataOriginLegacy
 			}
+
+			// Note: we filter the results with ACLs *before* applying the user-supplied
+			// bexpr filter to ensure that the user can only run expressions on data that
+			// they have access to.  This is a security measure to prevent users from
+			// running arbitrary expressions on data they don't have access to.
+			// QueryMeta.ResultsFilteredByACLs being true already indicates to the user
+			// that results they don't have access to have been removed.  If they were
+			// also allowed to run the bexpr filter on the data, they could potentially
+			// infer the specific attributes of data they don't have access to.
+			if err := s.srv.filterACL(args.Token, reply); err != nil {
+				return err
+			}
+
 			raw, err := filter.Execute(reply.Intentions)
 			if err != nil {
 				return err
 			}
 			reply.Intentions = raw.(structs.Intentions)
-
-			// Note: we filter the results with ACLs *after* applying the user-supplied
-			// bexpr filter, to ensure QueryMeta.ResultsFilteredByACLs does not include
-			// results that would be filtered out even if the user did have permission.
-			if err := s.srv.filterACL(args.Token, reply); err != nil {
-				return err
-			}
 
 			return nil
 		},
@@ -752,19 +758,7 @@ func (s *Intention) Check(args *structs.IntentionQueryRequest, reply *structs.In
 		}
 	}
 
-	// Note: the default intention policy is like an intention with a
-	// wildcarded destination in that it is limited to L4-only.
-
-	// No match, we need to determine the default behavior. We do this by
-	// fetching the default intention behavior from the resolved authorizer.
-	// The default behavior if ACLs are disabled is to allow connections
-	// to mimic the behavior of Consul itself: everything is allowed if
-	// ACLs are disabled.
-	//
-	// NOTE(mitchellh): This is the same behavior as the agent authorize
-	// endpoint. If this behavior is incorrect, we should also change it there
-	// which is much more important.
-	defaultDecision := authz.IntentionDefaultAllow(nil)
+	defaultAllow := DefaultIntentionAllow(authz, s.srv.config.DefaultIntentionPolicy)
 
 	store := s.srv.fsm.State()
 
@@ -784,7 +778,7 @@ func (s *Intention) Check(args *structs.IntentionQueryRequest, reply *structs.In
 		Partition:        query.DestinationPartition,
 		Intentions:       intentions,
 		MatchType:        structs.IntentionMatchDestination,
-		DefaultDecision:  defaultDecision,
+		DefaultAllow:     defaultAllow,
 		AllowPermissions: false,
 	}
 	decision, err := store.IntentionDecision(opts)

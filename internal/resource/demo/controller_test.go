@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package demo
 
@@ -16,7 +16,9 @@ import (
 )
 
 func TestArtistReconciler(t *testing.T) {
-	client := svctest.RunResourceService(t, RegisterTypes)
+	client := svctest.NewResourceServiceBuilder().
+		WithRegisterFns(RegisterTypes).
+		Run(t)
 
 	// Seed the database with an artist.
 	res, err := GenerateV2Artist()

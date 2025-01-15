@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package proxycfgglue
 
@@ -69,6 +69,8 @@ func newConfigEntryRequest(req *structs.ConfigEntryQuery, deps ServerDataSourceD
 		topic = pbsubscribe.Topic_HTTPRoute
 	case structs.TCPRoute:
 		topic = pbsubscribe.Topic_TCPRoute
+	case structs.FileSystemCertificate:
+		topic = pbsubscribe.Topic_FileSystemCertificate
 	case structs.InlineCertificate:
 		topic = pbsubscribe.Topic_InlineCertificate
 	case structs.BoundAPIGateway:

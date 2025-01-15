@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package consul
 
@@ -783,7 +783,7 @@ service "foo" {
 }
 operator = "read"
 `
-	id := createToken(t, codec, rules)
+	token := createToken(t, codec, rules)
 
 	// Create some dummy service/proxy configs to be looked up.
 	state := s1.fsm.State()
@@ -804,7 +804,7 @@ operator = "read"
 	args := structs.ConfigEntryQuery{
 		Kind:         structs.ServiceDefaults,
 		Datacenter:   s1.config.Datacenter,
-		QueryOptions: structs.QueryOptions{Token: id},
+		QueryOptions: structs.QueryOptions{Token: token},
 	}
 	var out structs.IndexedConfigEntries
 	err := msgpackrpc.CallWithCodec(codec, "ConfigEntry.List", &args, &out)
@@ -828,6 +828,58 @@ operator = "read"
 	require.Equal(t, structs.ProxyConfigGlobal, proxyConf.Name)
 	require.Equal(t, structs.ProxyDefaults, proxyConf.Kind)
 	require.False(t, out.QueryMeta.ResultsFilteredByACLs, "ResultsFilteredByACLs should be false")
+
+	// ensure ACL filtering occurs before bexpr filtering.
+	const bexprMatchingUserTokenPermissions = "Name matches `f.*`"
+	const bexprNotMatchingUserTokenPermissions = "Name matches `db.*`"
+
+	t.Run("request with filter that matches token permissions returns 1 result and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		args = structs.ConfigEntryQuery{
+			Kind:       structs.ServiceDefaults,
+			Datacenter: s1.config.Datacenter,
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexprMatchingUserTokenPermissions,
+			},
+		}
+		var reply structs.IndexedConfigEntries
+		err = msgpackrpc.CallWithCodec(codec, "ConfigEntry.List", &args, &reply)
+		require.NoError(t, err)
+		require.Equal(t, 1, len(reply.Entries))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that does not match token permissions returns 0 results and ResultsFilteredByACLs equal to true", func(t *testing.T) {
+		args = structs.ConfigEntryQuery{
+			Kind:       structs.ServiceDefaults,
+			Datacenter: s1.config.Datacenter,
+			QueryOptions: structs.QueryOptions{
+				Token:  token,
+				Filter: bexprNotMatchingUserTokenPermissions,
+			},
+		}
+		var reply structs.IndexedConfigEntries
+		err = msgpackrpc.CallWithCodec(codec, "ConfigEntry.List", &args, &reply)
+		require.NoError(t, err)
+		require.Zero(t, len(reply.Entries))
+		require.True(t, reply.ResultsFilteredByACLs)
+	})
+
+	t.Run("request with filter that would normally match but without any token returns zero results and ResultsFilteredByACLs equal to false", func(t *testing.T) {
+		args = structs.ConfigEntryQuery{
+			Kind:       structs.ServiceDefaults,
+			Datacenter: s1.config.Datacenter,
+			QueryOptions: structs.QueryOptions{
+				Token:  "", // no token
+				Filter: bexprNotMatchingUserTokenPermissions,
+			},
+		}
+		var reply structs.IndexedConfigEntries
+		err = msgpackrpc.CallWithCodec(codec, "ConfigEntry.List", &args, &reply)
+		require.NoError(t, err)
+		require.Zero(t, len(reply.Entries))
+		require.False(t, reply.ResultsFilteredByACLs)
+	})
 }
 
 func TestConfigEntry_ListAll_ACLDeny(t *testing.T) {
@@ -1445,16 +1497,6 @@ func TestConfigEntry_ResolveServiceConfig_Upstreams(t *testing.T) {
 				},
 				UpstreamConfigs: structs.OpaqueUpstreamConfigs{
 					{
-						Upstream: structs.PeeredServiceName{
-							ServiceName: structs.NewServiceName(
-								structs.WildcardSpecifier,
-								acl.DefaultEnterpriseMeta().WithWildcardNamespace()),
-						},
-						Config: map[string]interface{}{
-							"protocol": "grpc",
-						},
-					},
-					{
 						Upstream: cache,
 						Config: map[string]interface{}{
 							"protocol": "grpc",
@@ -1510,12 +1552,6 @@ func TestConfigEntry_ResolveServiceConfig_Upstreams(t *testing.T) {
 					"protocol": "grpc",
 				},
 				UpstreamConfigs: structs.OpaqueUpstreamConfigs{
-					{
-						Upstream: wildcard,
-						Config: map[string]interface{}{
-							"protocol": "grpc",
-						},
-					},
 					{
 						Upstream: cache,
 						Config: map[string]interface{}{
@@ -2268,17 +2304,6 @@ func TestConfigEntry_ResolveServiceConfig_UpstreamProxyDefaultsProtocol(t *testi
 
 	expected := structs.OpaqueUpstreamConfigs{
 		{
-			Upstream: structs.PeeredServiceName{
-				ServiceName: structs.NewServiceName(
-					structs.WildcardSpecifier,
-					acl.DefaultEnterpriseMeta().WithWildcardNamespace(),
-				),
-			},
-			Config: map[string]interface{}{
-				"protocol": "http",
-			},
-		},
-		{
 			Upstream: id("bar"),
 			Config: map[string]interface{}{
 				"protocol": "http",
@@ -2346,16 +2371,6 @@ func TestConfigEntry_ResolveServiceConfig_ProxyDefaultsProtocol_UsedForAllUpstre
 			"protocol": "http",
 		},
 		UpstreamConfigs: structs.OpaqueUpstreamConfigs{
-			{
-				Upstream: structs.PeeredServiceName{
-					ServiceName: structs.NewServiceName(
-						structs.WildcardSpecifier,
-						acl.DefaultEnterpriseMeta().WithWildcardNamespace()),
-				},
-				Config: map[string]interface{}{
-					"protocol": "http",
-				},
-			},
 			{
 				Upstream: psn,
 				Config: map[string]interface{}{

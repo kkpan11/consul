@@ -1,10 +1,11 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -33,6 +34,7 @@ import (
 	"github.com/hashicorp/consul/agent/grpc-internal/resolver"
 	grpcWare "github.com/hashicorp/consul/agent/grpc-middleware"
 	"github.com/hashicorp/consul/agent/hcp"
+	"github.com/hashicorp/consul/agent/leafcert"
 	"github.com/hashicorp/consul/agent/local"
 	"github.com/hashicorp/consul/agent/pool"
 	"github.com/hashicorp/consul/agent/router"
@@ -53,15 +55,43 @@ import (
 type BaseDeps struct {
 	consul.Deps // TODO: un-embed
 
-	RuntimeConfig *config.RuntimeConfig
-	MetricsConfig *lib.MetricsConfig
-	AutoConfig    *autoconf.AutoConfig // TODO: use an interface
-	Cache         *cache.Cache
-	ViewStore     *submatview.Store
-	WatchedFiles  []string
+	RuntimeConfig   *config.RuntimeConfig
+	MetricsConfig   *lib.MetricsConfig
+	AutoConfig      *autoconf.AutoConfig // TODO: use an interface
+	Cache           *cache.Cache
+	LeafCertManager *leafcert.Manager
+	ViewStore       *submatview.Store
+	WatchedFiles    []string
+	NetRPC          *LazyNetRPC
 
 	deregisterBalancer, deregisterResolver func()
 	stopHostCollector                      context.CancelFunc
+}
+
+type NetRPC interface {
+	RPC(ctx context.Context, method string, args any, reply any) error
+}
+
+type LazyNetRPC struct {
+	mu  sync.RWMutex
+	rpc NetRPC
+}
+
+func (r *LazyNetRPC) SetNetRPC(rpc NetRPC) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rpc = rpc
+}
+
+func (r *LazyNetRPC) RPC(ctx context.Context, method string, args any, reply any) error {
+	r.mu.RLock()
+	r2 := r.rpc
+	r.mu.RUnlock()
+
+	if r2 == nil {
+		return errors.New("rpc: initialization ordering error; net-rpc not ready yet")
+	}
+	return r2.RPC(ctx, method, args, reply)
 }
 
 type ConfigLoader func(source config.Source) (config.LoadResult, error)
@@ -73,6 +103,7 @@ func NewBaseDeps(configLoader ConfigLoader, logOut io.Writer, providedLogger hcl
 		return d, err
 	}
 	d.WatchedFiles = result.WatchedFiles
+	d.Experiments = result.RuntimeConfig.Experiments
 	cfg := result.RuntimeConfig
 	logConf := cfg.Logging
 	logConf.Name = logging.Agent
@@ -107,7 +138,10 @@ func NewBaseDeps(configLoader ConfigLoader, logOut io.Writer, providedLogger hcl
 
 	var extraSinks []metrics.MetricSink
 	if cfg.IsCloudEnabled() {
-		d.HCP, err = hcp.NewDeps(cfg.Cloud, d.Logger.Named("hcp"), cfg.NodeID)
+		// This values is set late within newNodeIDFromConfig above
+		cfg.Cloud.NodeID = cfg.NodeID
+
+		d.HCP, err = hcp.NewDeps(cfg.Cloud, d.Logger.Named("hcp"), cfg.DataDir)
 		if err != nil {
 			return d, err
 		}
@@ -139,6 +173,20 @@ func NewBaseDeps(configLoader ConfigLoader, logOut io.Writer, providedLogger hcl
 	d.Cache = cache.New(cfg.Cache)
 	d.ViewStore = submatview.NewStore(d.Logger.Named("viewstore"))
 	d.ConnPool = newConnPool(cfg, d.Logger, d.TLSConfigurator)
+
+	d.NetRPC = &LazyNetRPC{}
+
+	// TODO: create leafCertManager in BaseDeps once NetRPC is available without Agent
+	d.LeafCertManager = leafcert.NewManager(leafcert.Deps{
+		Logger:      d.Logger.Named("leaf-certs"),
+		CertSigner:  leafcert.NewNetRPCCertSigner(d.NetRPC),
+		RootsReader: leafcert.NewCachedRootsReader(d.Cache, cfg.Datacenter),
+		Config: leafcert.Config{
+			TestOverrideCAChangeInitialDelay: cfg.ConnectTestCALeafRootChangeSpread,
+		},
+	})
+	// Set the leaf cert manager in the embedded deps type so it can be used by consul servers.
+	d.Deps.LeafCertManager = d.LeafCertManager
 
 	agentType := "client"
 	if cfg.ServerMode {
@@ -197,6 +245,7 @@ func NewBaseDeps(configLoader ConfigLoader, logOut io.Writer, providedLogger hcl
 		ServerProvider:   d.Router,
 		TLSConfigurator:  d.TLSConfigurator,
 		Cache:            d.Cache,
+		LeafCertManager:  d.LeafCertManager,
 		Tokens:           d.Tokens,
 		EnterpriseConfig: initEnterpriseAutoConfig(d.EnterpriseDeps, cfg),
 	}
@@ -213,6 +262,8 @@ func NewBaseDeps(configLoader ConfigLoader, logOut io.Writer, providedLogger hcl
 
 	d.XDSStreamLimiter = limiter.NewSessionLimiter()
 
+	d.Registry = consul.NewTypeRegistry()
+
 	return d, nil
 }
 
@@ -220,7 +271,11 @@ func NewBaseDeps(configLoader ConfigLoader, logOut io.Writer, providedLogger hcl
 // handled by something else (e.g. the agent stop channel).
 func (bd BaseDeps) Close() {
 	bd.AutoConfig.Stop()
+	bd.LeafCertManager.Stop()
 	bd.MetricsConfig.Cancel()
+	if bd.HCP.Sink != nil {
+		bd.HCP.Sink.Shutdown()
+	}
 
 	for _, fn := range []func(){bd.deregisterBalancer, bd.deregisterResolver, bd.stopHostCollector} {
 		if fn != nil {
@@ -329,7 +384,9 @@ func getPrometheusDefs(cfg *config.RuntimeConfig, isServer bool) ([]prometheus.G
 		gauges = append(gauges, verifierGauges)
 	}
 
-	if isServer && cfg.RaftLogStoreConfig.Backend == consul.LogStoreBackendWAL {
+	if isServer &&
+		(cfg.RaftLogStoreConfig.Backend == consul.LogStoreBackendWAL ||
+			cfg.RaftLogStoreConfig.Backend == consul.LogStoreBackendDefault) {
 
 		walGauges := make([]prometheus.GaugeDefinition, 0)
 		for _, d := range wal.MetricDefinitions.Gauges {
@@ -400,7 +457,9 @@ func getPrometheusDefs(cfg *config.RuntimeConfig, isServer bool) ([]prometheus.G
 		}
 		counters = append(counters, verifierCounters)
 	}
-	if isServer && cfg.RaftLogStoreConfig.Backend == consul.LogStoreBackendWAL {
+	if isServer &&
+		(cfg.RaftLogStoreConfig.Backend == consul.LogStoreBackendWAL ||
+			cfg.RaftLogStoreConfig.Backend == consul.LogStoreBackendDefault) {
 		walCounters := make([]prometheus.CounterDefinition, 0)
 		for _, d := range wal.MetricDefinitions.Counters {
 			walCounters = append(walCounters, prometheus.CounterDefinition{
@@ -456,7 +515,7 @@ func getPrometheusDefs(cfg *config.RuntimeConfig, isServer bool) ([]prometheus.G
 		consul.LeaderSummaries,
 		consul.PreparedQuerySummaries,
 		consul.RPCSummaries,
-		consul.SegmentOSSSummaries,
+		consul.SegmentCESummaries,
 		consul.SessionSummaries,
 		consul.SessionEndpointSummaries,
 		consul.TxnSummaries,

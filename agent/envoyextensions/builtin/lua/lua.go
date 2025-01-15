@@ -1,11 +1,12 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package lua
 
 import (
 	"errors"
 	"fmt"
+	envoy_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 
 	envoy_listener_v3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	envoy_lua_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
@@ -45,6 +46,9 @@ func (l *lua) fromArguments(args map[string]interface{}) error {
 	if err := mapstructure.Decode(args, l); err != nil {
 		return fmt.Errorf("error decoding extension arguments: %v", err)
 	}
+	if l.ProxyType == "" {
+		l.ProxyType = string(api.ServiceKindConnectProxy)
+	}
 	return l.validate()
 }
 
@@ -53,7 +57,7 @@ func (l *lua) validate() error {
 	if l.Script == "" {
 		resultErr = multierror.Append(resultErr, fmt.Errorf("missing Script value"))
 	}
-	if l.ProxyType != "connect-proxy" {
+	if l.ProxyType != string(api.ServiceKindConnectProxy) {
 		resultErr = multierror.Append(resultErr, fmt.Errorf("unexpected ProxyType %q", l.ProxyType))
 	}
 	if l.Listener != "inbound" && l.Listener != "outbound" {
@@ -94,7 +98,11 @@ func (l *lua) PatchFilter(p extensioncommon.FilterPayload) (*envoy_listener_v3.F
 	luaHttpFilter, err := extensioncommon.MakeEnvoyHTTPFilter(
 		"envoy.filters.http.lua",
 		&envoy_lua_v3.Lua{
-			InlineCode: l.Script,
+			DefaultSourceCode: &envoy_core_v3.DataSource{
+				Specifier: &envoy_core_v3.DataSource_InlineString{
+					InlineString: l.Script,
+				},
+			},
 		},
 	)
 	if err != nil {

@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
 package blockingquery
 
 import (
@@ -25,6 +28,8 @@ type QueryFn func(memdb.WatchSet, *state.Store) error
 
 // RequestOptions are options used by Server.blockingQuery to modify the
 // behaviour of the query operation, or to populate response metadata.
+//
+//go:generate mockery --name RequestOptions --inpackage
 type RequestOptions interface {
 	GetToken() string
 	GetMinQueryIndex() uint64
@@ -34,6 +39,8 @@ type RequestOptions interface {
 
 // ResponseMeta is an interface used to populate the response struct
 // with metadata about the query and the state of the server.
+//
+//go:generate mockery --name ResponseMeta --inpackage
 type ResponseMeta interface {
 	SetLastContact(time.Duration)
 	SetKnownLeader(bool)
@@ -44,6 +51,8 @@ type ResponseMeta interface {
 
 // FSMServer is interface into the stateful components of a Consul server, such
 // as memdb or raft leadership.
+//
+//go:generate mockery --name FSMServer --inpackage
 type FSMServer interface {
 	ConsistentRead() error
 	DecrementBlockingQueries() uint64

@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package consul
 
@@ -9,15 +9,17 @@ import (
 	"os"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"github.com/hashicorp/memberlist"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/serf/serf"
-	"golang.org/x/time/rate"
 
 	"github.com/hashicorp/consul/agent/checks"
 	consulrate "github.com/hashicorp/consul/agent/consul/rate"
+	hcpconfig "github.com/hashicorp/consul/agent/hcp/config"
 	"github.com/hashicorp/consul/agent/structs"
-	libserf "github.com/hashicorp/consul/lib/serf"
+	"github.com/hashicorp/consul/internal/gossip/libserf"
 	"github.com/hashicorp/consul/tlsutil"
 	"github.com/hashicorp/consul/types"
 	"github.com/hashicorp/consul/version"
@@ -40,8 +42,9 @@ const (
 
 	// LogStoreBackend* are well-known string values used to configure different
 	// log store backends.
-	LogStoreBackendBoltDB = "boltdb"
-	LogStoreBackendWAL    = "wal"
+	LogStoreBackendDefault = "default"
+	LogStoreBackendBoltDB  = "boltdb"
+	LogStoreBackendWAL     = "wal"
 )
 
 var (
@@ -402,12 +405,21 @@ type Config struct {
 	// report usage metrics to the configured go-metrics Sinks.
 	MetricsReportingInterval time.Duration
 
+	DisablePerTenancyUsageMetrics bool
+
 	// ConnectEnabled is whether to enable Connect features such as the CA.
 	ConnectEnabled bool
 
 	// ConnectMeshGatewayWANFederationEnabled determines if wan federation of
 	// datacenters should exclusively traverse mesh gateways.
 	ConnectMeshGatewayWANFederationEnabled bool
+
+	// DefaultIntentionPolicy is used to define a default intention action for all
+	// sources and destinations. Possible values are "allow", "deny", or "" (blank).
+	// For compatibility, falls back to ACLResolverSettings.ACLDefaultPolicy (which
+	// itself has a default of "allow") if left blank. Future versions of Consul
+	// will default this field to "deny" to be secure by default.
+	DefaultIntentionPolicy string
 
 	// DisableFederationStateAntiEntropy solely exists for use in unit tests to
 	// disable a background routine.
@@ -441,7 +453,7 @@ type Config struct {
 
 	Locality *structs.Locality
 
-	Cloud CloudConfig
+	Cloud hcpconfig.CloudConfig
 
 	Reporting Reporting
 
@@ -468,21 +480,17 @@ func (c *Config) CheckProtocolVersion() error {
 	return nil
 }
 
-// CheckACL validates the ACL configuration.
-// TODO: move this to ACLResolverSettings
-func (c *Config) CheckACL() error {
-	switch c.ACLResolverSettings.ACLDefaultPolicy {
-	case "allow":
-	case "deny":
-	default:
-		return fmt.Errorf("Unsupported default ACL policy: %s", c.ACLResolverSettings.ACLDefaultPolicy)
+// CheckEnumStrings validates string configuration which must be specific values.
+func (c *Config) CheckEnumStrings() error {
+	if err := c.ACLResolverSettings.CheckACLs(); err != nil {
+		return err
 	}
-	switch c.ACLResolverSettings.ACLDownPolicy {
-	case "allow":
-	case "deny":
-	case "async-cache", "extend-cache":
+	switch c.DefaultIntentionPolicy {
+	case structs.IntentionDefaultPolicyAllow:
+	case structs.IntentionDefaultPolicyDeny:
+	case "":
 	default:
-		return fmt.Errorf("Unsupported down ACL policy: %s", c.ACLResolverSettings.ACLDownPolicy)
+		return fmt.Errorf("Unsupported default intention policy: %s", c.DefaultIntentionPolicy)
 	}
 	return nil
 }

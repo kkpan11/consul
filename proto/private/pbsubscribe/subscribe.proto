@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 /*
    Package event provides a service for subscribing to state change events.
@@ -106,6 +106,12 @@ enum Topic {
 
   // JWTProvider topic contains events for changes to jwt-provider
   JWTProvider = 16;
+
+  // ExportedServices topic contains events for changes to exported-services.
+  ExportedServices = 17;
+
+  // FileSystemCertificate topic contains events for changes to file-system-certificates.
+  FileSystemCertificate = 18;
 }
 
 message NamedSubject {

@@ -1,97 +1,99 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package hcp
 
 import (
 	"context"
 	"fmt"
-	"net/url"
-	"time"
 
 	"github.com/armon/go-metrics"
-	hcpclient "github.com/hashicorp/consul/agent/hcp/client"
+	"github.com/hashicorp/go-hclog"
+	"go.opentelemetry.io/otel"
+
+	"github.com/hashicorp/consul/agent/hcp/client"
 	"github.com/hashicorp/consul/agent/hcp/config"
 	"github.com/hashicorp/consul/agent/hcp/scada"
 	"github.com/hashicorp/consul/agent/hcp/telemetry"
-	"github.com/hashicorp/consul/types"
-	"github.com/hashicorp/go-hclog"
 )
 
 // Deps contains the interfaces that the rest of Consul core depends on for HCP integration.
 type Deps struct {
-	Client   hcpclient.Client
-	Provider scada.Provider
-	Sink     metrics.MetricSink
+	Config            config.CloudConfig
+	Provider          scada.Provider
+	Sink              metrics.ShutdownSink
+	TelemetryProvider *hcpProviderImpl
+	DataDir           string
 }
 
-func NewDeps(cfg config.CloudConfig, logger hclog.Logger, nodeID types.NodeID) (Deps, error) {
-	client, err := hcpclient.NewClient(cfg)
-	if err != nil {
-		return Deps{}, fmt.Errorf("failed to init client: %w:", err)
-	}
+func NewDeps(cfg config.CloudConfig, logger hclog.Logger, dataDir string) (Deps, error) {
+	ctx := context.Background()
+	ctx = hclog.WithContext(ctx, logger)
 
-	provider, err := scada.New(cfg, logger.Named("scada"))
+	provider, err := scada.New(logger.Named("scada"))
 	if err != nil {
 		return Deps{}, fmt.Errorf("failed to init scada: %w", err)
 	}
 
-	sink := sink(client, &cfg, logger.Named("sink"), nodeID)
+	metricsProvider := NewHCPProvider(ctx)
+	if err != nil {
+		logger.Error("failed to init HCP metrics provider", "error", err)
+		return Deps{}, fmt.Errorf("failed to init HCP metrics provider: %w", err)
+	}
+
+	metricsClient := client.NewMetricsClient(ctx, metricsProvider)
+
+	sink, err := newSink(ctx, metricsClient, metricsProvider)
+	if err != nil {
+		// Do not prevent server start if sink init fails, only log error.
+		logger.Error("failed to init sink", "error", err)
+	}
 
 	return Deps{
-		Client:   client,
-		Provider: provider,
-		Sink:     sink,
+		Config:            cfg,
+		Provider:          provider,
+		Sink:              sink,
+		TelemetryProvider: metricsProvider,
+		DataDir:           dataDir,
 	}, nil
 }
 
-// sink provides initializes an OTELSink which forwards Consul metrics to HCP.
-// The sink is only initialized if the server is registered with the management plane (CCM).
-// This step should not block server initialization, so errors are logged, but not returned.
-func sink(hcpClient hcpclient.Client, cfg hcpclient.CloudConfig, logger hclog.Logger, nodeID types.NodeID) metrics.MetricSink {
-	ctx := context.Background()
-	ctx = hclog.WithContext(ctx, logger)
+// newSink initializes an OTELSink which forwards Consul metrics to HCP.
+// This step should not block server initialization, errors are returned, only to be logged.
+func newSink(
+	ctx context.Context,
+	metricsClient telemetry.MetricsClient,
+	cfgProvider *hcpProviderImpl,
+) (metrics.ShutdownSink, error) {
+	logger := hclog.FromContext(ctx)
 
-	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+	// Set the global OTEL error handler. Without this, on any failure to publish metrics in
+	// otelExporter.Export, the default OTEL handler logs to stderr without the formatting or group
+	// that hclog provides. Here we override that global error handler once so logs are
+	// in the standard format and include "hcp" in the group name like:
+	// 2024-02-06T22:35:19.072Z [ERROR] agent.hcp: failed to export metrics: failed to export metrics: code 404: 404 page not found
+	otel.SetErrorHandler(&otelErrorHandler{logger: logger})
 
-	telemetryCfg, err := hcpClient.FetchTelemetryConfig(reqCtx)
-	if err != nil {
-		logger.Error("failed to fetch telemetry config", "error", err)
-		return nil
-	}
-
-	endpoint, isEnabled := telemetryCfg.Enabled()
-	if !isEnabled {
-		return nil
-	}
-
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		logger.Error("failed to parse url endpoint", "error", err)
-		return nil
-	}
-
-	metricsClient, err := hcpclient.NewMetricsClient(cfg, ctx)
-	if err != nil {
-		logger.Error("failed to init metrics client", "error", err)
-		return nil
-	}
-
+	reader := telemetry.NewOTELReader(metricsClient, cfgProvider)
 	sinkOpts := &telemetry.OTELSinkOpts{
-		Ctx:     ctx,
-		Reader:  telemetry.NewOTELReader(metricsClient, u, telemetry.DefaultExportInterval),
-		Labels:  telemetryCfg.DefaultLabels(string(nodeID)),
-		Filters: telemetryCfg.MetricsConfig.Filters,
+		Reader:         reader,
+		ConfigProvider: cfgProvider,
 	}
 
-	sink, err := telemetry.NewOTELSink(sinkOpts)
+	sink, err := telemetry.NewOTELSink(ctx, sinkOpts)
 	if err != nil {
-		logger.Error("failed to init OTEL sink", "error", err)
-		return nil
+		return nil, fmt.Errorf("failed to create OTELSink: %w", err)
 	}
 
 	logger.Debug("initialized HCP metrics sink")
 
-	return sink
+	return sink, nil
+}
+
+type otelErrorHandler struct {
+	logger hclog.Logger
+}
+
+func (o *otelErrorHandler) Handle(err error) {
+	o.logger.Error(err.Error())
 }

@@ -1,10 +1,11 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package xds
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,23 +13,28 @@ import (
 	"testing"
 	"time"
 
-	"github.com/armon/go-metrics"
-	envoy_discovery_v3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
-	"github.com/stretchr/testify/require"
-	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
+	"github.com/hashicorp/consul/envoyextensions/xdscommon"
 
+	"github.com/armon/go-metrics"
+	envoy_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	envoy_listener_v3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	envoy_discovery_v3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"github.com/hashicorp/consul/acl"
 	"github.com/hashicorp/consul/agent/grpc-external/limiter"
 	"github.com/hashicorp/consul/agent/proxycfg"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/hashicorp/consul/api"
-	"github.com/hashicorp/consul/envoyextensions/xdscommon"
+	"github.com/hashicorp/consul/envoyextensions/extensioncommon"
 	"github.com/hashicorp/consul/sdk/testutil"
 	"github.com/hashicorp/consul/sdk/testutil/retry"
 	"github.com/hashicorp/consul/version"
+	"github.com/hashicorp/go-hclog"
+	goversion "github.com/hashicorp/go-version"
+	"github.com/stretchr/testify/require"
+	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // NOTE: For these tests, prefer not using xDS protobuf "factory" methods if
@@ -816,6 +822,147 @@ func TestServer_DeltaAggregatedResources_v3_BasicProtocol_TCP_clusterChangesImpa
 	}
 }
 
+func TestServer_DeltaAggregatedResources_v3_BasicProtocol_TCP_clusterChangeBeforeEndpointAck(t *testing.T) {
+	// This test ensures that the following race condition does not block indefinitely:
+	// - Send update endpoints
+	// - Send update cluster
+	// - Recv ACK endpoints
+	// - Recv ACK cluster
+	// Prior to a bug fix, this would have resulted in the endpoints NOT existing in Envoy. This occurred because
+	// the cluster update implicitly clears the endpoints in Envoy, but we would never re-send the endpoint data
+	// to compensate for the loss because we would incorrectly ACK the invalid old endpoint hash. Since the
+	// endpoint's hash did not actually change, they would not be resent.
+	aclResolve := func(id string) (acl.Authorizer, error) {
+		// Allow all
+		return acl.RootAuthorizer("manage"), nil
+	}
+	scenario := newTestServerDeltaScenario(t, aclResolve, "web-sidecar-proxy", "", 0)
+	mgr, errCh, envoy := scenario.mgr, scenario.errCh, scenario.envoy
+
+	sid := structs.NewServiceID("web-sidecar-proxy", nil)
+
+	// Register the proxy to create state needed to Watch() on
+	mgr.RegisterProxy(t, sid)
+
+	var snap *proxycfg.ConfigSnapshot
+	testutil.RunStep(t, "initial setup", func(t *testing.T) {
+		snap = newTestSnapshot(t, nil, "", nil)
+
+		// Send initial cluster discover.
+		envoy.SendDeltaReq(t, xdscommon.ClusterType, &envoy_discovery_v3.DeltaDiscoveryRequest{})
+
+		// Check no response sent yet
+		assertDeltaChanBlocked(t, envoy.deltaStream.sendCh)
+
+		requireProtocolVersionGauge(t, scenario, "v3", 1)
+
+		// Deliver a new snapshot (tcp with one tcp upstream)
+		mgr.DeliverConfig(t, sid, snap)
+
+		assertDeltaResponseSent(t, envoy.deltaStream.sendCh, &envoy_discovery_v3.DeltaDiscoveryResponse{
+			TypeUrl: xdscommon.ClusterType,
+			Nonce:   hexString(1),
+			Resources: makeTestResources(t,
+				makeTestCluster(t, snap, "tcp:local_app"),
+				makeTestCluster(t, snap, "tcp:db"),
+				makeTestCluster(t, snap, "tcp:geo-cache"),
+			),
+		})
+	})
+
+	var newSnap *proxycfg.ConfigSnapshot
+	testutil.RunStep(t, "resend cluster immediately", func(t *testing.T) {
+		// Deliver updated snapshot with new CA roots and leaf certificate. This will not be
+		// sent to Envoy until the initial set of cluster message is ACKed.
+		newSnap = newTestSnapshot(t, nil, "", nil)
+		mgr.DeliverConfig(t, sid, newSnap)
+
+		// Envoy then tries to discover endpoints for clusters.
+		envoy.SendDeltaReq(t, xdscommon.EndpointType, &envoy_discovery_v3.DeltaDiscoveryRequest{
+			ResourceNamesSubscribe: []string{
+				"db.default.dc1.internal.11111111-2222-3333-4444-555555555555.consul",
+				"geo-cache.default.dc1.query.11111111-2222-3333-4444-555555555555.consul",
+			},
+		})
+
+		// We should get a response immediately since the config is already present in
+		// the server for endpoints. Note that this should not be racy if the server
+		// is behaving well since the Cluster send above should be blocked until we
+		// deliver a new config version.
+		assertDeltaResponseSent(t, envoy.deltaStream.sendCh, &envoy_discovery_v3.DeltaDiscoveryResponse{
+			TypeUrl: xdscommon.EndpointType,
+			Nonce:   hexString(2),
+			Resources: makeTestResources(t,
+				makeTestEndpoints(t, snap, "tcp:db"),
+				makeTestEndpoints(t, snap, "tcp:geo-cache"),
+			),
+		})
+
+		// After receiving the endpoints Envoy sends an ACK for the clusters
+		envoy.SendDeltaReqACK(t, xdscommon.ClusterType, 1)
+
+		// The updated cluster snapshot with new certificates is sent immediately
+		// after the first is ACKed.
+		assertDeltaResponseSent(t, envoy.deltaStream.sendCh, &envoy_discovery_v3.DeltaDiscoveryResponse{
+			TypeUrl: xdscommon.ClusterType,
+			Nonce:   hexString(3),
+			Resources: makeTestResources(t,
+				// SAME makeTestCluster(t, snap, "tcp:local_app"),
+				makeTestCluster(t, newSnap, "tcp:db"),
+				makeTestCluster(t, newSnap, "tcp:geo-cache"),
+			),
+		})
+	})
+
+	testutil.RunStep(t, "resend endpoints", func(t *testing.T) {
+		// Envoy requests listeners because it has received endpoints. We won't send listeners
+		// until Envoy ACKs the second cluster update.
+		envoy.SendDeltaReq(t, xdscommon.ListenerType, nil)
+
+		// Envoy ACKs the endpoints from the first cluster update.
+		envoy.SendDeltaReqACK(t, xdscommon.EndpointType, 2)
+
+		// Resend endpoints because the clusters changed.
+		assertDeltaResponseSent(t, envoy.deltaStream.sendCh, &envoy_discovery_v3.DeltaDiscoveryResponse{
+			TypeUrl: xdscommon.EndpointType,
+			Nonce:   hexString(4),
+			Resources: makeTestResources(t,
+				makeTestEndpoints(t, newSnap, "tcp:db"),
+				makeTestEndpoints(t, newSnap, "tcp:geo-cache"),
+			),
+		})
+
+		// Envoy ACKs the new cluster and endpoints.
+		envoy.SendDeltaReqACK(t, xdscommon.ClusterType, 3)
+		envoy.SendDeltaReqACK(t, xdscommon.EndpointType, 4)
+
+		// Listeners are sent after the cluster and endpoints are ACKed.
+		assertDeltaResponseSent(t, envoy.deltaStream.sendCh, &envoy_discovery_v3.DeltaDiscoveryResponse{
+			TypeUrl: xdscommon.ListenerType,
+			Nonce:   hexString(5),
+			Resources: makeTestResources(t,
+				makeTestListener(t, newSnap, "tcp:public_listener"),
+				makeTestListener(t, newSnap, "tcp:db"),
+				makeTestListener(t, newSnap, "tcp:geo-cache"),
+			),
+		})
+
+		// We are caught up, so there should be nothing queued to send.
+		assertDeltaChanBlocked(t, envoy.deltaStream.sendCh)
+
+		// ACKs the listener
+		envoy.SendDeltaReqACK(t, xdscommon.ListenerType, 5)
+	})
+
+	envoy.Close()
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(50 * time.Millisecond):
+		t.Fatalf("timed out waiting for handler to finish")
+	}
+}
+
 func TestServer_DeltaAggregatedResources_v3_BasicProtocol_HTTP2_RDS_listenerChangesImpactRoutes(t *testing.T) {
 	aclResolve := func(id string) (acl.Authorizer, error) {
 		// Allow all
@@ -1461,6 +1608,34 @@ func TestServer_DeltaAggregatedResources_v3_CapacityReached(t *testing.T) {
 	}
 }
 
+func TestServer_DeltaAggregatedResources_v3_CfgSrcTerminated(t *testing.T) {
+	aclResolve := func(id string) (acl.Authorizer, error) { return acl.ManageAll(), nil }
+
+	scenario := newTestServerDeltaScenario(t, aclResolve, "web-sidecar-proxy", "", 0)
+	mgr, errCh, envoy := scenario.mgr, scenario.errCh, scenario.envoy
+
+	sid := structs.NewServiceID("web-sidecar-proxy", nil)
+
+	mgr.RegisterProxy(t, sid)
+
+	snap := newTestSnapshot(t, nil, "", nil)
+	envoy.SendDeltaReq(t, xdscommon.ClusterType, &envoy_discovery_v3.DeltaDiscoveryRequest{
+		InitialResourceVersions: mustMakeVersionMap(t,
+			makeTestCluster(t, snap, "tcp:geo-cache"),
+		),
+	})
+	mgr.CfgSrcTerminate(sid)
+
+	select {
+	case err := <-errCh:
+		require.Error(t, err)
+		require.Equal(t, codes.Internal.String(), status.Code(err).String())
+		require.Equal(t, errConfigSyncError, err)
+	case <-time.After(50 * time.Millisecond):
+		t.Fatalf("timed out waiting for handler to finish")
+	}
+}
+
 type capacityReachedLimiter struct{}
 
 func (capacityReachedLimiter) BeginSession() (limiter.Session, error) {
@@ -1608,4 +1783,417 @@ func requireExtensionMetrics(
 		}
 		require.True(t, foundLabel)
 	}
+}
+
+func Test_validateAndApplyEnvoyExtension_Validations(t *testing.T) {
+	type testCase struct {
+		name          string
+		runtimeConfig extensioncommon.RuntimeConfig
+		err           bool
+		errString     string
+	}
+
+	envoyVersion, _ := goversion.NewVersion("1.25.0")
+	consulVersion, _ := goversion.NewVersion("1.16.0")
+
+	svc := api.CompoundServiceName{
+		Name:      "s1",
+		Partition: "ap1",
+		Namespace: "ns1",
+	}
+
+	makeRuntimeConfig := func(required bool, consulVersion string, envoyVersion string, args map[string]interface{}) extensioncommon.RuntimeConfig {
+		if args == nil {
+			args = map[string]interface{}{
+				"ARN": "arn:aws:lambda:us-east-1:111111111111:function:lambda-1234",
+			}
+
+		}
+		return extensioncommon.RuntimeConfig{
+			EnvoyExtension: api.EnvoyExtension{
+				Name:          api.BuiltinAWSLambdaExtension,
+				Required:      required,
+				ConsulVersion: consulVersion,
+				EnvoyVersion:  envoyVersion,
+				Arguments:     args,
+			},
+			ServiceName: svc,
+		}
+	}
+
+	cases := []testCase{
+		{
+			name:          "invalid consul version constraint - required",
+			runtimeConfig: makeRuntimeConfig(true, "bad", ">= 1.0", nil),
+			err:           true,
+			errString:     "failed to parse Consul version constraint for extension",
+		},
+		{
+			name:          "invalid consul version constraint - not required",
+			runtimeConfig: makeRuntimeConfig(false, "bad", ">= 1.0", nil),
+			err:           false,
+		},
+		{
+			name:          "invalid envoy version constraint - required",
+			runtimeConfig: makeRuntimeConfig(true, ">= 1.0", "bad", nil),
+			err:           true,
+			errString:     "failed to parse Envoy version constraint for extension",
+		},
+		{
+			name:          "invalid envoy version constraint - not required",
+			runtimeConfig: makeRuntimeConfig(false, ">= 1.0", "bad", nil),
+			err:           false,
+		},
+		{
+			name:          "no envoy version constraint match",
+			runtimeConfig: makeRuntimeConfig(false, "", ">= 2.0.0", nil),
+			err:           false,
+		},
+		{
+			name:          "no consul version constraint match",
+			runtimeConfig: makeRuntimeConfig(false, ">= 2.0.0", "", nil),
+			err:           false,
+		},
+		{
+			name:          "invalid extension arguments - required",
+			runtimeConfig: makeRuntimeConfig(true, ">= 1.15.0", ">= 1.25.0", map[string]interface{}{"bad": "args"}),
+			err:           true,
+			errString:     "failed to construct extension",
+		},
+		{
+			name:          "invalid extension arguments - not required",
+			runtimeConfig: makeRuntimeConfig(false, ">= 1.15.0", ">= 1.25.0", map[string]interface{}{"bad": "args"}),
+			err:           false,
+		},
+		{
+			name:          "valid everything - no resources and required",
+			runtimeConfig: makeRuntimeConfig(true, ">= 1.15.0", ">= 1.25.0", nil),
+			err:           true,
+			errString:     "failed to patch xDS resources in",
+		},
+		{
+			name:          "valid everything",
+			runtimeConfig: makeRuntimeConfig(false, ">= 1.15.0", ">= 1.25.0", nil),
+			err:           false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snap := proxycfg.ConfigSnapshot{
+				ProxyID: proxycfg.ProxyID{
+					ServiceID: structs.NewServiceID("s1", nil),
+				},
+			}
+			resources, err := validateAndApplyEnvoyExtension(hclog.NewNullLogger(), &snap, nil, tc.runtimeConfig, envoyVersion, consulVersion)
+			if tc.err {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.errString)
+			} else {
+				require.NoError(t, err)
+				require.Nil(t, resources)
+			}
+		})
+	}
+}
+
+func Test_applyEnvoyExtension_CanApply(t *testing.T) {
+	type testCase struct {
+		name     string
+		canApply bool
+	}
+
+	cases := []testCase{
+		{
+			name:     "cannot apply: is not applied",
+			canApply: false,
+		},
+		{
+			name:     "can apply: is applied",
+			canApply: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			extender := extensioncommon.BasicEnvoyExtender{
+				Extension: &maybeCanApplyExtension{
+					canApply: tc.canApply,
+				},
+			}
+			config := &extensioncommon.RuntimeConfig{
+				Kind:                  api.ServiceKindConnectProxy,
+				ServiceName:           api.CompoundServiceName{Name: "api"},
+				Upstreams:             map[api.CompoundServiceName]*extensioncommon.UpstreamData{},
+				IsSourcedFromUpstream: false,
+				EnvoyExtension: api.EnvoyExtension{
+					Name:     "maybeCanApplyExtension",
+					Required: false,
+				},
+			}
+			listener := &envoy_listener_v3.Listener{
+				Name:                  xdscommon.OutboundListenerName,
+				IgnoreGlobalConnLimit: false,
+			}
+			indexedResources := xdscommon.IndexResources(testutil.Logger(t), map[string][]proto.Message{
+				xdscommon.ListenerType: {
+					listener,
+				},
+			})
+
+			result, err := applyEnvoyExtension(&extender, indexedResources, config)
+			require.NoError(t, err)
+			resultListener := result.Index[xdscommon.ListenerType][xdscommon.OutboundListenerName].(*envoy_listener_v3.Listener)
+			require.Equal(t, tc.canApply, resultListener.IgnoreGlobalConnLimit)
+		})
+	}
+}
+
+func Test_applyEnvoyExtension_PartialApplicationDisallowed(t *testing.T) {
+	type testCase struct {
+		name            string
+		fail            bool
+		returnOnFailure bool
+	}
+
+	cases := []testCase{
+		{
+			name:            "failure: returns nothing",
+			fail:            true,
+			returnOnFailure: false,
+		},
+		// Not expected, but cover to be sure.
+		{
+			name:            "failure: returns values",
+			fail:            true,
+			returnOnFailure: true,
+		},
+		// Ensure that under normal circumstances, the extension would succeed in
+		// modifying resources.
+		{
+			name: "success: resources modified",
+			fail: false,
+		},
+	}
+
+	for _, tc := range cases {
+		for _, indexType := range []string{
+			xdscommon.ListenerType,
+			xdscommon.ClusterType,
+		} {
+			typeShortName := indexType[strings.LastIndex(indexType, ".")+1:]
+			t.Run(fmt.Sprintf("%s: %s", tc.name, typeShortName), func(t *testing.T) {
+				extender := extensioncommon.BasicEnvoyExtender{
+					Extension: &partialFailureExtension{
+						returnOnFailure: tc.returnOnFailure,
+						// Alternate which resource fails so that we can test for
+						// partial modification independent of patch order.
+						failListener: tc.fail && indexType == xdscommon.ListenerType,
+						failCluster:  tc.fail && indexType == xdscommon.ClusterType,
+					},
+				}
+				config := &extensioncommon.RuntimeConfig{
+					Kind:                  api.ServiceKindConnectProxy,
+					ServiceName:           api.CompoundServiceName{Name: "api"},
+					Upstreams:             map[api.CompoundServiceName]*extensioncommon.UpstreamData{},
+					IsSourcedFromUpstream: false,
+					EnvoyExtension: api.EnvoyExtension{
+						Name:     "partialFailureExtension",
+						Required: false,
+					},
+				}
+				cluster := &envoy_cluster_v3.Cluster{
+					Name:          xdscommon.LocalAppClusterName,
+					RespectDnsTtl: false,
+				}
+				listener := &envoy_listener_v3.Listener{
+					Name:                  xdscommon.OutboundListenerName,
+					IgnoreGlobalConnLimit: false,
+				}
+				indexedResources := xdscommon.IndexResources(testutil.Logger(t), map[string][]proto.Message{
+					xdscommon.ClusterType: {
+						cluster,
+					},
+					xdscommon.ListenerType: {
+						listener,
+					},
+				})
+
+				result, err := applyEnvoyExtension(&extender, indexedResources, config)
+				if tc.fail {
+					require.Error(t, err)
+				} else {
+					require.NoError(t, err)
+				}
+
+				resultListener := result.Index[xdscommon.ListenerType][xdscommon.OutboundListenerName].(*envoy_listener_v3.Listener)
+				resultCluster := result.Index[xdscommon.ClusterType][xdscommon.LocalAppClusterName].(*envoy_cluster_v3.Cluster)
+				require.Equal(t, !tc.fail, resultListener.IgnoreGlobalConnLimit)
+				require.Equal(t, !tc.fail, resultCluster.RespectDnsTtl)
+
+				// Regardless of success, original values should not be modified.
+				originalListener := indexedResources.Index[xdscommon.ListenerType][xdscommon.OutboundListenerName].(*envoy_listener_v3.Listener)
+				originalCluster := indexedResources.Index[xdscommon.ClusterType][xdscommon.LocalAppClusterName].(*envoy_cluster_v3.Cluster)
+				require.False(t, originalListener.IgnoreGlobalConnLimit)
+				require.False(t, originalCluster.RespectDnsTtl)
+			})
+		}
+	}
+}
+
+func Test_applyEnvoyExtension_HandlesPanics(t *testing.T) {
+	type testCase struct {
+		name            string
+		panicOnCanApply bool
+		panicOnPatch    bool
+	}
+
+	cases := []testCase{
+		{
+			name:            "panic: CanApply",
+			panicOnCanApply: true,
+		},
+		{
+			name:         "panic: Extend",
+			panicOnPatch: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			extension := &maybePanicExtension{
+				panicOnCanApply: tc.panicOnCanApply,
+				panicOnPatch:    tc.panicOnPatch,
+			}
+			extender := extensioncommon.BasicEnvoyExtender{
+				Extension: extension,
+			}
+			config := &extensioncommon.RuntimeConfig{
+				Kind:                  api.ServiceKindConnectProxy,
+				ServiceName:           api.CompoundServiceName{Name: "api"},
+				Upstreams:             map[api.CompoundServiceName]*extensioncommon.UpstreamData{},
+				IsSourcedFromUpstream: false,
+				EnvoyExtension: api.EnvoyExtension{
+					Name:     "maybePanicExtension",
+					Required: false,
+				},
+			}
+			listener := &envoy_listener_v3.Listener{
+				Name:                  xdscommon.OutboundListenerName,
+				IgnoreGlobalConnLimit: false,
+			}
+			indexedResources := xdscommon.IndexResources(testutil.Logger(t), map[string][]proto.Message{
+				xdscommon.ListenerType: {
+					listener,
+				},
+			})
+
+			_, err := applyEnvoyExtension(&extender, indexedResources, config)
+
+			// We did not panic, good.
+			// First assert our test is valid by forcing a panic, then check the error message that was returned.
+			if tc.panicOnCanApply {
+				require.PanicsWithError(t, "this is an expected failure in CanApply", func() {
+					extension.CanApply(config)
+				})
+				require.ErrorContains(t, err, "attempt to apply Envoy extension \"maybePanicExtension\" caused an unexpected panic: this is an expected failure in CanApply")
+			}
+			if tc.panicOnPatch {
+				require.PanicsWithError(t, "this is an expected failure in PatchListener", func() {
+					_, _, _ = extension.PatchListener(config.GetListenerPayload(listener))
+				})
+				require.ErrorContains(t, err, "attempt to apply Envoy extension \"maybePanicExtension\" caused an unexpected panic: this is an expected failure in PatchListener")
+			}
+		})
+	}
+}
+
+type maybeCanApplyExtension struct {
+	extensioncommon.BasicExtensionAdapter
+	canApply bool
+}
+
+var _ extensioncommon.BasicExtension = (*maybeCanApplyExtension)(nil)
+
+func (m *maybeCanApplyExtension) CanApply(_ *extensioncommon.RuntimeConfig) bool {
+	return m.canApply
+}
+
+func (m *maybeCanApplyExtension) PatchListener(payload extensioncommon.ListenerPayload) (*envoy_listener_v3.Listener, bool, error) {
+	payload.Message.IgnoreGlobalConnLimit = true
+	return payload.Message, true, nil
+}
+
+type partialFailureExtension struct {
+	extensioncommon.BasicExtensionAdapter
+	returnOnFailure bool
+	failCluster     bool
+	failListener    bool
+}
+
+var _ extensioncommon.BasicExtension = (*partialFailureExtension)(nil)
+
+func (p *partialFailureExtension) CanApply(_ *extensioncommon.RuntimeConfig) bool {
+	return true
+}
+
+func (p *partialFailureExtension) PatchListener(payload extensioncommon.ListenerPayload) (*envoy_listener_v3.Listener, bool, error) {
+	// Modify original input message
+	payload.Message.IgnoreGlobalConnLimit = true
+
+	err := fmt.Errorf("oops - listener patch failed")
+	if !p.failListener {
+		err = nil
+	}
+
+	returnMsg := payload.Message
+	if err != nil && !p.returnOnFailure {
+		returnMsg = nil
+	}
+
+	patched := err == nil || p.returnOnFailure
+
+	return returnMsg, patched, err
+}
+
+func (p *partialFailureExtension) PatchCluster(payload extensioncommon.ClusterPayload) (*envoy_cluster_v3.Cluster, bool, error) {
+	// Modify original input message
+	payload.Message.RespectDnsTtl = true
+
+	err := fmt.Errorf("oops - cluster patch failed")
+	if !p.failCluster {
+		err = nil
+	}
+
+	returnMsg := payload.Message
+	if err != nil && !p.returnOnFailure {
+		returnMsg = nil
+	}
+
+	patched := err == nil || p.returnOnFailure
+
+	return returnMsg, patched, err
+}
+
+type maybePanicExtension struct {
+	extensioncommon.BasicExtensionAdapter
+	panicOnCanApply bool
+	panicOnPatch    bool
+}
+
+var _ extensioncommon.BasicExtension = (*maybePanicExtension)(nil)
+
+func (m *maybePanicExtension) CanApply(_ *extensioncommon.RuntimeConfig) bool {
+	if m.panicOnCanApply {
+		panic(fmt.Errorf("this is an expected failure in CanApply"))
+	}
+	return true
+}
+
+func (m *maybePanicExtension) PatchListener(payload extensioncommon.ListenerPayload) (*envoy_listener_v3.Listener, bool, error) {
+	if m.panicOnPatch {
+		panic(fmt.Errorf("this is an expected failure in PatchListener"))
+	}
+	payload.Message.IgnoreGlobalConnLimit = true
+	return payload.Message, true, nil
 }

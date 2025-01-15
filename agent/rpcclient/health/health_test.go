@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package health
 
@@ -94,6 +94,17 @@ func TestClient_ServiceNodes_BackendRouting(t *testing.T) {
 				Datacenter:         "dc1",
 				ServiceName:        "web1",
 				MergeCentralConfig: true,
+				QueryOptions:       structs.QueryOptions{MinQueryIndex: 22},
+			},
+			expected: useRPC,
+		},
+		{
+			name: "rpc if sameness group",
+			req: structs.ServiceSpecificRequest{
+				Datacenter:         "dc1",
+				ServiceName:        "web1",
+				SamenessGroup:      "sg1",
+				MergeCentralConfig: false,
 				QueryOptions:       structs.QueryOptions{MinQueryIndex: 22},
 			},
 			expected: useRPC,
@@ -243,6 +254,15 @@ func TestClient_Notify_BackendRouting(t *testing.T) {
 				Datacenter:  "dc1",
 				ServiceName: "web1",
 				Source:      structs.QuerySource{Node: "node1"},
+			},
+			expected: useCache,
+		},
+		{
+			name: "use cache for sameness group request",
+			req: structs.ServiceSpecificRequest{
+				Datacenter:    "dc1",
+				ServiceName:   "web1",
+				SamenessGroup: "test-group",
 			},
 			expected: useCache,
 		},

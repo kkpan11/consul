@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package extauthz
 
@@ -23,6 +23,8 @@ type extAuthz struct {
 	ProxyType api.ServiceKind
 	// InsertOptions controls how the extension inserts the filter.
 	InsertOptions ext_cmn.InsertOptions
+	// ListenerType controls which listener the extension applies to. It supports "inbound" or "outbound" listeners.
+	ListenerType string
 	// Config holds the extension configuration.
 	Config extAuthzConfig
 }
@@ -61,12 +63,18 @@ func (a *extAuthz) PatchClusters(cfg *ext_cmn.RuntimeConfig, c ext_cmn.ClusterMa
 	return c, nil
 }
 
+func (a *extAuthz) matchesListenerDirection(isInboundListener bool) bool {
+	return (!isInboundListener && a.ListenerType == "outbound") || (isInboundListener && a.ListenerType == "inbound")
+}
+
 // PatchFilters inserts an ext-authz filter into the list of network filters or the filter chain of the HTTP connection manager.
 func (a *extAuthz) PatchFilters(cfg *ext_cmn.RuntimeConfig, filters []*envoy_listener_v3.Filter, isInboundListener bool) ([]*envoy_listener_v3.Filter, error) {
 	// The ext_authz extension only patches filters for inbound listeners.
-	if !isInboundListener {
+	if !a.matchesListenerDirection(isInboundListener) {
 		return filters, nil
 	}
+
+	a.configureInsertOptions(cfg.Protocol)
 
 	switch cfg.Protocol {
 	case "grpc", "http2", "http":
@@ -107,13 +115,31 @@ func (a *extAuthz) fromArguments(args map[string]any) error {
 	return a.validate()
 }
 
+func (a *extAuthz) configureInsertOptions(protocol string) {
+	// If the insert options have been expressly configured, then use them.
+	if a.InsertOptions.Location != "" {
+		return
+	}
+
+	// Configure the default, insert the filter immediately before the terminal filter.
+	a.InsertOptions.Location = ext_cmn.InsertBeforeFirstMatch
+	switch protocol {
+	case "grpc", "http2", "http":
+		a.InsertOptions.FilterName = "envoy.filters.http.router"
+	default:
+		a.InsertOptions.FilterName = "envoy.filters.network.tcp_proxy"
+	}
+}
+
 func (a *extAuthz) normalize() {
 	if a.ProxyType == "" {
 		a.ProxyType = api.ServiceKindConnectProxy
 	}
-	if a.InsertOptions.Location == "" {
-		a.InsertOptions.Location = ext_cmn.InsertFirst
+
+	if a.ListenerType == "" {
+		a.ListenerType = "inbound"
 	}
+
 	a.Config.normalize()
 }
 
@@ -123,6 +149,10 @@ func (a *extAuthz) validate() error {
 		resultErr = multierror.Append(resultErr, fmt.Errorf("unsupported ProxyType %q, only %q is supported",
 			a.ProxyType,
 			api.ServiceKindConnectProxy))
+	}
+
+	if a.ListenerType != "inbound" && a.ListenerType != "outbound" {
+		resultErr = multierror.Append(resultErr, fmt.Errorf(`unexpected ListenerType %q, supported values are "inbound" or "outbound"`, a.ListenerType))
 	}
 
 	if err := a.Config.validate(); err != nil {

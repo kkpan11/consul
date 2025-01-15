@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package hcp
 
@@ -154,7 +154,7 @@ func (s *MockHCPServer) handleStatus(r *http.Request, cluster resource.Resource)
 		req.ServerState.Raft.IsLeader,
 		req.ServerState.Raft.KnownLeader,
 		req.ServerState.Autopilot.Healthy,
-		time.Until(time.Time(req.ServerState.TLS.CertExpiry)).Hours()/24,
+		time.Until(time.Time(req.ServerState.ServerTLS.InternalRPC.CertExpiry)).Hours()/24,
 	)
 	s.servers[req.ServerState.Name] = &gnmmod.HashicorpCloudGlobalNetworkManager20220215Server{
 		GossipPort: req.ServerState.GossipPort,

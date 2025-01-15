@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package xds
 
@@ -12,7 +12,6 @@ import (
 
 	envoy_rbac_v3 "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
 	envoy_matcher_v3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -451,10 +450,11 @@ func TestRemoveIntentionPrecedence(t *testing.T) {
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			rbacIxns := intentionListToIntermediateRBACForm(tt.intentions, testLocalInfo, tt.http, testPeerTrustBundle)
+			rbacIxns, err := intentionListToIntermediateRBACForm(tt.intentions, testLocalInfo, tt.http, testPeerTrustBundle, nil)
 			intentionDefaultAction := intentionActionFromBool(tt.intentionDefaultAllow)
 			rbacIxns = removeIntentionPrecedence(rbacIxns, intentionDefaultAction, testLocalInfo)
 
+			require.NoError(t, err)
 			require.Equal(t, tt.expect, rbacIxns)
 		})
 	}
@@ -529,6 +529,10 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 				{Path: []string{"perms", "role"}, Value: "admin"},
 			},
 		}
+		testJWTProviderConfigEntry = map[string]*structs.JWTProviderConfigEntry{
+			"okta":  {Name: "okta", Issuer: "mytest.okta-issuer"},
+			"auth0": {Name: "auth0", Issuer: "mytest.auth0-issuer"},
+		}
 		jwtRequirement = &structs.IntentionJWTRequirement{
 			Providers: []*structs.IntentionJWTProvider{
 				&oktaWithClaims,
@@ -549,11 +553,11 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 
 	tests := map[string]struct {
 		intentionDefaultAllow bool
-		intentions            structs.SimplifiedIntentions
+		v1Intentions          structs.SimplifiedIntentions
 	}{
 		"default-deny-mixed-precedence": {
 			intentionDefaultAllow: false,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testIntention(t, "web", "api", structs.IntentionActionAllow),
 				testIntention(t, "*", "api", structs.IntentionActionDeny),
 				testIntention(t, "web", "*", structs.IntentionActionDeny),
@@ -561,38 +565,38 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 		},
 		"default-deny-service-wildcard-allow": {
 			intentionDefaultAllow: false,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testSourceIntention("*", structs.IntentionActionAllow),
 			),
 		},
 		"default-allow-service-wildcard-deny": {
 			intentionDefaultAllow: true,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testSourceIntention("*", structs.IntentionActionDeny),
 			),
 		},
 		"default-deny-one-allow": {
 			intentionDefaultAllow: false,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testSourceIntention("web", structs.IntentionActionAllow),
 			),
 		},
 		"default-allow-one-deny": {
 			intentionDefaultAllow: true,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testSourceIntention("web", structs.IntentionActionDeny),
 			),
 		},
 		"default-deny-allow-deny": {
 			intentionDefaultAllow: false,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testSourceIntention("web", structs.IntentionActionDeny),
 				testSourceIntention("*", structs.IntentionActionAllow),
 			),
 		},
 		"default-deny-kitchen-sink": {
 			intentionDefaultAllow: false,
-			intentions: sorted(
+			v1Intentions: sorted(
 				// (double exact)
 				testSourceIntention("web", structs.IntentionActionAllow),
 				testSourceIntention("unsafe", structs.IntentionActionDeny),
@@ -602,7 +606,7 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 		},
 		"default-allow-kitchen-sink": {
 			intentionDefaultAllow: true,
-			intentions: sorted(
+			v1Intentions: sorted(
 				// (double exact)
 				testSourceIntention("web", structs.IntentionActionDeny),
 				testSourceIntention("unsafe", structs.IntentionActionAllow),
@@ -612,7 +616,7 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 		},
 		"default-deny-peered-kitchen-sink": {
 			intentionDefaultAllow: false,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testSourceIntention("web", structs.IntentionActionAllow),
 				testIntentionPeered("*", "peer1", structs.IntentionActionAllow),
 				testIntentionPeered("web", "peer1", structs.IntentionActionDeny),
@@ -621,32 +625,32 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 		// ========================
 		"default-allow-path-allow": {
 			intentionDefaultAllow: true,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testSourcePermIntention("web", permSlashPrefix),
 			),
 		},
 		"default-deny-path-allow": {
 			intentionDefaultAllow: false,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testSourcePermIntention("web", permSlashPrefix),
 			),
 		},
 		"default-allow-path-deny": {
 			intentionDefaultAllow: true,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testSourcePermIntention("web", permDenySlashPrefix),
 			),
 		},
 		"default-deny-path-deny": {
 			intentionDefaultAllow: false,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testSourcePermIntention("web", permDenySlashPrefix),
 			),
 		},
 		// ========================
 		"default-allow-deny-all-and-path-allow": {
 			intentionDefaultAllow: true,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testSourcePermIntention("web",
 					&structs.IntentionPermission{
 						Action: structs.IntentionActionAllow,
@@ -660,7 +664,7 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 		},
 		"default-deny-deny-all-and-path-allow": {
 			intentionDefaultAllow: false,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testSourcePermIntention("web",
 					&structs.IntentionPermission{
 						Action: structs.IntentionActionAllow,
@@ -674,7 +678,7 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 		},
 		"default-allow-deny-all-and-path-deny": {
 			intentionDefaultAllow: true,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testSourcePermIntention("web",
 					&structs.IntentionPermission{
 						Action: structs.IntentionActionDeny,
@@ -688,7 +692,7 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 		},
 		"default-deny-deny-all-and-path-deny": {
 			intentionDefaultAllow: false,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testSourcePermIntention("web",
 					&structs.IntentionPermission{
 						Action: structs.IntentionActionDeny,
@@ -703,7 +707,7 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 		// ========================
 		"default-deny-two-path-deny-and-path-allow": {
 			intentionDefaultAllow: false,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testSourcePermIntention("web",
 					&structs.IntentionPermission{
 						Action: structs.IntentionActionDeny,
@@ -728,7 +732,7 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 		},
 		"default-allow-two-path-deny-and-path-allow": {
 			intentionDefaultAllow: true,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testSourcePermIntention("web",
 					&structs.IntentionPermission{
 						Action: structs.IntentionActionDeny,
@@ -753,7 +757,7 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 		},
 		"default-deny-single-intention-with-kitchen-sink-perms": {
 			intentionDefaultAllow: false,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testSourcePermIntention("web",
 					&structs.IntentionPermission{
 						Action: structs.IntentionActionDeny,
@@ -782,11 +786,19 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 								{Name: "x-bar", Exact: "xyz"},
 								{Name: "x-dib", Prefix: "gaz"},
 								{Name: "x-gir", Suffix: "zim"},
+								{Name: "x-baz", Contains: "qux"},
 								{Name: "x-zim", Regex: "gi[rR]"},
+								// Present does not support IgnoreCase
+								{Name: "y-bar", Exact: "xyz", IgnoreCase: true},
+								{Name: "y-dib", Prefix: "gaz", IgnoreCase: true},
+								{Name: "y-gir", Suffix: "zim", IgnoreCase: true},
+								{Name: "y-baz", Contains: "qux", IgnoreCase: true},
+								// Regex does not support IgnoreCase
 								{Name: "z-foo", Present: true, Invert: true},
 								{Name: "z-bar", Exact: "xyz", Invert: true},
 								{Name: "z-dib", Prefix: "gaz", Invert: true},
 								{Name: "z-gir", Suffix: "zim", Invert: true},
+								{Name: "z-baz", Contains: "qux", Invert: true},
 								{Name: "z-zim", Regex: "gi[rR]", Invert: true},
 							},
 						},
@@ -796,7 +808,7 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 		},
 		"default-allow-single-intention-with-kitchen-sink-perms": {
 			intentionDefaultAllow: true,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testSourcePermIntention("web",
 					&structs.IntentionPermission{
 						Action: structs.IntentionActionAllow,
@@ -821,15 +833,25 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 						Action: structs.IntentionActionDeny,
 						HTTP: &structs.IntentionHTTPPermission{
 							Header: []structs.IntentionHTTPHeaderPermission{
+								// Valid vanilla match options
 								{Name: "x-foo", Present: true},
 								{Name: "x-bar", Exact: "xyz"},
 								{Name: "x-dib", Prefix: "gaz"},
 								{Name: "x-gir", Suffix: "zim"},
+								{Name: "x-baz", Contains: "qux"},
 								{Name: "x-zim", Regex: "gi[rR]"},
+								// Valid ignore case match options
+								// (Present and Regex do not support IgnoreCase)
+								{Name: "y-bar", Exact: "xyz", IgnoreCase: true},
+								{Name: "y-dib", Prefix: "gaz", IgnoreCase: true},
+								{Name: "y-gir", Suffix: "zim", IgnoreCase: true},
+								{Name: "y-baz", Contains: "qux", IgnoreCase: true},
+								// Valid invert match options
 								{Name: "z-foo", Present: true, Invert: true},
 								{Name: "z-bar", Exact: "xyz", Invert: true},
 								{Name: "z-dib", Prefix: "gaz", Invert: true},
 								{Name: "z-gir", Suffix: "zim", Invert: true},
+								{Name: "z-baz", Contains: "qux", Invert: true},
 								{Name: "z-zim", Regex: "gi[rR]", Invert: true},
 							},
 						},
@@ -840,13 +862,13 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 		// ========= JWTAuthn Filter checks
 		"top-level-jwt-no-permissions": {
 			intentionDefaultAllow: false,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testIntentionWithJWT("web", structs.IntentionActionAllow, jwtRequirement),
 			),
 		},
 		"empty-top-level-jwt-with-one-permission": {
 			intentionDefaultAllow: false,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testIntentionWithJWT("web", structs.IntentionActionAllow, nil, &structs.IntentionPermission{
 					Action: structs.IntentionActionAllow,
 					HTTP: &structs.IntentionHTTPPermission{
@@ -858,7 +880,7 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 		},
 		"top-level-jwt-with-one-permission": {
 			intentionDefaultAllow: false,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testIntentionWithJWT("web",
 					structs.IntentionActionAllow,
 					jwtRequirement,
@@ -880,7 +902,7 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 		},
 		"top-level-jwt-with-multiple-permissions": {
 			intentionDefaultAllow: false,
-			intentions: sorted(
+			v1Intentions: sorted(
 				testIntentionWithJWT("web",
 					structs.IntentionActionAllow,
 					jwtRequirement,
@@ -912,20 +934,29 @@ func TestMakeRBACNetworkAndHTTPFilters(t *testing.T) {
 		tt := tt
 		t.Run(name, func(t *testing.T) {
 			t.Run("network filter", func(t *testing.T) {
-				filter, err := makeRBACNetworkFilter(tt.intentions, tt.intentionDefaultAllow, testLocalInfo, testPeerTrustBundle)
-				require.NoError(t, err)
 
 				t.Run("current", func(t *testing.T) {
+					if len(tt.v1Intentions) == 0 {
+						return
+					}
+
+					filter, err := makeRBACNetworkFilter(tt.v1Intentions, tt.intentionDefaultAllow, testLocalInfo, testPeerTrustBundle)
+					require.NoError(t, err)
 					gotJSON := protoToJSON(t, filter)
 
 					require.JSONEq(t, goldenSimple(t, filepath.Join("rbac", name), gotJSON), gotJSON)
 				})
 			})
+
 			t.Run("http filter", func(t *testing.T) {
-				filter, err := makeRBACHTTPFilter(tt.intentions, tt.intentionDefaultAllow, testLocalInfo, testPeerTrustBundle)
-				require.NoError(t, err)
 
 				t.Run("current", func(t *testing.T) {
+					if len(tt.v1Intentions) == 0 {
+						return
+					}
+
+					filter, err := makeRBACHTTPFilter(tt.v1Intentions, tt.intentionDefaultAllow, testLocalInfo, testPeerTrustBundle, testJWTProviderConfigEntry)
+					require.NoError(t, err)
 					gotJSON := protoToJSON(t, filter)
 
 					require.JSONEq(t, goldenSimple(t, filepath.Join("rbac", name+"--httpfilter"), gotJSON), gotJSON)
@@ -1202,7 +1233,7 @@ func TestPathToSegments(t *testing.T) {
 	}
 }
 
-func TestJwtClaimToPrincipal(t *testing.T) {
+func TestJWTClaimsToPrincipals(t *testing.T) {
 	var (
 		firstClaim = structs.IntentionJWTClaimVerification{
 			Path:  []string{"perms"},
@@ -1234,7 +1265,7 @@ func TestJwtClaimToPrincipal(t *testing.T) {
 			Identifier: &envoy_rbac_v3.Principal_Metadata{
 				Metadata: &envoy_matcher_v3.MetadataMatcher{
 					Filter: jwtEnvoyFilter,
-					Path:   pathToSegments(secondClaim.Path, "second-key"),
+					Path:   pathToSegments(secondClaim.Path, payloadKey),
 					Value: &envoy_matcher_v3.ValueMatcher{
 						MatchPattern: &envoy_matcher_v3.ValueMatcher_StringMatch{
 							StringMatch: &envoy_matcher_v3.StringMatcher{
@@ -1249,38 +1280,21 @@ func TestJwtClaimToPrincipal(t *testing.T) {
 		}
 	)
 	tests := map[string]struct {
-		jwtInfos []*JWTInfo
-		expected *envoy_rbac_v3.Principal
+		claims             []*structs.IntentionJWTClaimVerification
+		metadataPayloadKey string
+		expected           *envoy_rbac_v3.Principal
 	}{
-		"single-jwt-info": {
-			jwtInfos: []*JWTInfo{
-				{
-					Claims:             []*structs.IntentionJWTClaimVerification{&firstClaim},
-					MetadataPayloadKey: payloadKey,
-				},
-			},
-			expected: &envoy_rbac_v3.Principal{
-				Identifier: &envoy_rbac_v3.Principal_OrIds{
-					OrIds: &envoy_rbac_v3.Principal_Set{
-						Ids: []*envoy_rbac_v3.Principal{&firstPrincipal},
-					},
-				},
-			},
+		"single-claim": {
+			claims:             []*structs.IntentionJWTClaimVerification{&firstClaim},
+			metadataPayloadKey: payloadKey,
+			expected:           &firstPrincipal,
 		},
-		"multiple-jwt-info": {
-			jwtInfos: []*JWTInfo{
-				{
-					Claims:             []*structs.IntentionJWTClaimVerification{&firstClaim},
-					MetadataPayloadKey: payloadKey,
-				},
-				{
-					Claims:             []*structs.IntentionJWTClaimVerification{&secondClaim},
-					MetadataPayloadKey: "second-key",
-				},
-			},
+		"multiple-claims": {
+			claims:             []*structs.IntentionJWTClaimVerification{&firstClaim, &secondClaim},
+			metadataPayloadKey: payloadKey,
 			expected: &envoy_rbac_v3.Principal{
-				Identifier: &envoy_rbac_v3.Principal_OrIds{
-					OrIds: &envoy_rbac_v3.Principal_Set{
+				Identifier: &envoy_rbac_v3.Principal_AndIds{
+					AndIds: &envoy_rbac_v3.Principal_Set{
 						Ids: []*envoy_rbac_v3.Principal{&firstPrincipal, &secondPrincipal},
 					},
 				},
@@ -1291,7 +1305,7 @@ func TestJwtClaimToPrincipal(t *testing.T) {
 	for name, tt := range tests {
 		tt := tt
 		t.Run(name, func(t *testing.T) {
-			principal := jwtInfosToPrincipals(tt.jwtInfos)
+			principal := jwtClaimsToPrincipals(tt.claims, tt.metadataPayloadKey)
 			require.Equal(t, principal, tt.expected)
 		})
 	}

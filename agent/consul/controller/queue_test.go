@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package controller
 
@@ -59,8 +59,8 @@ func (c *countingWorkQueue[T]) adds() uint64 {
 	return atomic.LoadUint64(&c.addCounter)
 }
 
-func (c *countingWorkQueue[T]) AddAfter(item T, duration time.Duration) {
-	c.inner.AddAfter(item, duration)
+func (c *countingWorkQueue[T]) AddAfter(item T, duration time.Duration, override bool) {
+	c.inner.AddAfter(item, duration, override)
 	atomic.AddUint64(&c.addAfterCounter, 1)
 }
 

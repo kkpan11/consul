@@ -1,16 +1,20 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
 	httptransport "github.com/go-openapi/runtime/client"
 	"github.com/go-openapi/strfmt"
+	"golang.org/x/oauth2"
 
 	hcptelemetry "github.com/hashicorp/hcp-sdk-go/clients/cloud-consul-telemetry-gateway/preview/2023-04-14/client/consul_telemetry_service"
 	hcpgnm "github.com/hashicorp/hcp-sdk-go/clients/cloud-global-network-manager-service/preview/2022-02-15/client/global_network_manager_service"
@@ -31,23 +35,10 @@ const metricsGatewayPath = "/v1/metrics"
 type Client interface {
 	FetchBootstrap(ctx context.Context) (*BootstrapConfig, error)
 	FetchTelemetryConfig(ctx context.Context) (*TelemetryConfig, error)
+	GetObservabilitySecret(ctx context.Context) (clientID, clientSecret string, err error)
 	PushServerStatus(ctx context.Context, status *ServerStatus) error
 	DiscoverServers(ctx context.Context) ([]string, error)
-}
-
-// MetricsConfig holds metrics specific configuration for the TelemetryConfig.
-// The endpoint field overrides the TelemetryConfig endpoint.
-type MetricsConfig struct {
-	Filters  []string
-	Endpoint string
-}
-
-// TelemetryConfig contains configuration for telemetry data forwarded by Consul servers
-// to the HCP Telemetry gateway.
-type TelemetryConfig struct {
-	Endpoint      string
-	Labels        map[string]string
-	MetricsConfig *MetricsConfig
+	GetCluster(ctx context.Context) (*Cluster, error)
 }
 
 type BootstrapConfig struct {
@@ -59,6 +50,12 @@ type BootstrapConfig struct {
 	TLSCAs          []string
 	ConsulConfig    string
 	ManagementToken string
+}
+
+type Cluster struct {
+	Name         string
+	HCPPortalURL string
+	AccessLevel  *gnmmod.HashicorpCloudGlobalNetworkManager20220215ClusterConsulAccessLevel
 }
 
 type hcpClient struct {
@@ -112,10 +109,14 @@ func (c *hcpClient) FetchTelemetryConfig(ctx context.Context) (*TelemetryConfig,
 
 	resp, err := c.tgw.AgentTelemetryConfig(params, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch from HCP: %w", err)
 	}
 
-	return convertTelemetryConfig(resp)
+	if err := validateAgentTelemetryConfigPayload(resp); err != nil {
+		return nil, fmt.Errorf("invalid response payload: %w", err)
+	}
+
+	return convertAgentTelemetryResponse(ctx, resp, c.cfg)
 }
 
 func (c *hcpClient) FetchBootstrap(ctx context.Context) (*BootstrapConfig, error) {
@@ -128,9 +129,8 @@ func (c *hcpClient) FetchBootstrap(ctx context.Context) (*BootstrapConfig, error
 
 	resp, err := c.gnm.AgentBootstrapConfig(params, nil)
 	if err != nil {
-		return nil, err
+		return nil, decodeError(err)
 	}
-
 	return bootstrapConfigFromHCP(resp.Payload), nil
 }
 
@@ -166,6 +166,8 @@ func (c *hcpClient) PushServerStatus(ctx context.Context, s *ServerStatus) error
 	return err
 }
 
+// ServerStatus is used to collect server status information in order to push
+// to HCP. Fields should mirror HashicorpCloudGlobalNetworkManager20220215ServerState
 type ServerStatus struct {
 	ID         string
 	Name       string
@@ -175,10 +177,15 @@ type ServerStatus struct {
 	RPCPort    int
 	Datacenter string
 
-	Autopilot ServerAutopilot
-	Raft      ServerRaft
-	TLS       ServerTLSInfo
-	ACL       ServerACLInfo
+	Autopilot         ServerAutopilot
+	Raft              ServerRaft
+	ACL               ServerACLInfo
+	ServerTLSMetadata ServerTLSMetadata
+
+	// TODO: TLS will be deprecated in favor of ServerTLSInfo in GNM. Handle
+	// removal in a subsequent PR
+	// https://hashicorp.atlassian.net/browse/CC-7015
+	TLS ServerTLSInfo
 
 	ScadaStatus string
 }
@@ -202,20 +209,47 @@ type ServerACLInfo struct {
 	Enabled bool
 }
 
+// ServerTLSInfo mirrors HashicorpCloudGlobalNetworkManager20220215TLSInfo
 type ServerTLSInfo struct {
-	Enabled              bool
-	CertExpiry           time.Time
-	CertName             string
-	CertSerial           string
-	VerifyIncoming       bool
-	VerifyOutgoing       bool
-	VerifyServerHostname bool
+	Enabled                bool
+	CertExpiry             time.Time
+	CertIssuer             string
+	CertName               string
+	CertSerial             string
+	CertificateAuthorities []CertificateMetadata
+	VerifyIncoming         bool
+	VerifyOutgoing         bool
+	VerifyServerHostname   bool
+}
+
+// ServerTLSMetadata mirrors HashicorpCloudGlobalNetworkManager20220215ServerTLSMetadata
+type ServerTLSMetadata struct {
+	InternalRPC ServerTLSInfo
+}
+
+// CertificateMetadata mirrors HashicorpCloudGlobalNetworkManager20220215CertificateMetadata
+type CertificateMetadata struct {
+	CertExpiry time.Time
+	CertName   string
+	CertSerial string
 }
 
 func serverStatusToHCP(s *ServerStatus) *gnmmod.HashicorpCloudGlobalNetworkManager20220215ServerState {
 	if s == nil {
 		return nil
 	}
+
+	// Convert CA metadata
+	caCerts := make([]*gnmmod.HashicorpCloudGlobalNetworkManager20220215CertificateMetadata,
+		len(s.ServerTLSMetadata.InternalRPC.CertificateAuthorities))
+	for ix, ca := range s.ServerTLSMetadata.InternalRPC.CertificateAuthorities {
+		caCerts[ix] = &gnmmod.HashicorpCloudGlobalNetworkManager20220215CertificateMetadata{
+			CertExpiry: strfmt.DateTime(ca.CertExpiry),
+			CertName:   ca.CertName,
+			CertSerial: ca.CertSerial,
+		}
+	}
+
 	return &gnmmod.HashicorpCloudGlobalNetworkManager20220215ServerState{
 		Autopilot: &gnmmod.HashicorpCloudGlobalNetworkManager20220215AutoPilotInfo{
 			FailureTolerance: int32(s.Autopilot.FailureTolerance),
@@ -236,6 +270,9 @@ func serverStatusToHCP(s *ServerStatus) *gnmmod.HashicorpCloudGlobalNetworkManag
 		},
 		RPCPort: int32(s.RPCPort),
 		TLS: &gnmmod.HashicorpCloudGlobalNetworkManager20220215TLSInfo{
+			// TODO: remove TLS in preference for ServerTLSMetadata.InternalRPC
+			// when deprecation path is ready
+			// https://hashicorp.atlassian.net/browse/CC-7015
 			CertExpiry:           strfmt.DateTime(s.TLS.CertExpiry),
 			CertName:             s.TLS.CertName,
 			CertSerial:           s.TLS.CertSerial,
@@ -243,6 +280,19 @@ func serverStatusToHCP(s *ServerStatus) *gnmmod.HashicorpCloudGlobalNetworkManag
 			VerifyIncoming:       s.TLS.VerifyIncoming,
 			VerifyOutgoing:       s.TLS.VerifyOutgoing,
 			VerifyServerHostname: s.TLS.VerifyServerHostname,
+		},
+		ServerTLS: &gnmmod.HashicorpCloudGlobalNetworkManager20220215ServerTLSMetadata{
+			InternalRPC: &gnmmod.HashicorpCloudGlobalNetworkManager20220215TLSInfo{
+				CertExpiry:             strfmt.DateTime(s.ServerTLSMetadata.InternalRPC.CertExpiry),
+				CertIssuer:             s.ServerTLSMetadata.InternalRPC.CertIssuer,
+				CertName:               s.ServerTLSMetadata.InternalRPC.CertName,
+				CertSerial:             s.ServerTLSMetadata.InternalRPC.CertSerial,
+				Enabled:                s.ServerTLSMetadata.InternalRPC.Enabled,
+				VerifyIncoming:         s.ServerTLSMetadata.InternalRPC.VerifyIncoming,
+				VerifyOutgoing:         s.ServerTLSMetadata.InternalRPC.VerifyOutgoing,
+				VerifyServerHostname:   s.ServerTLSMetadata.InternalRPC.VerifyServerHostname,
+				CertificateAuthorities: caCerts,
+			},
 		},
 		Version:     s.Version,
 		ScadaStatus: s.ScadaStatus,
@@ -273,54 +323,69 @@ func (c *hcpClient) DiscoverServers(ctx context.Context) ([]string, error) {
 	return servers, nil
 }
 
-// convertTelemetryConfig validates the AgentTelemetryConfig payload and converts it into a TelemetryConfig object.
-func convertTelemetryConfig(resp *hcptelemetry.AgentTelemetryConfigOK) (*TelemetryConfig, error) {
-	if resp.Payload == nil {
-		return nil, fmt.Errorf("missing payload")
+func (c *hcpClient) GetCluster(ctx context.Context) (*Cluster, error) {
+	params := hcpgnm.NewGetClusterParamsWithContext(ctx).
+		WithID(c.resource.ID).
+		WithLocationOrganizationID(c.resource.Organization).
+		WithLocationProjectID(c.resource.Project)
+
+	resp, err := c.gnm.GetCluster(params, nil)
+	if err != nil {
+		return nil, decodeError(err)
 	}
 
-	if resp.Payload.TelemetryConfig == nil {
-		return nil, fmt.Errorf("missing telemetry config")
-	}
-
-	payloadConfig := resp.Payload.TelemetryConfig
-	var metricsConfig MetricsConfig
-	if payloadConfig.Metrics != nil {
-		metricsConfig.Endpoint = payloadConfig.Metrics.Endpoint
-		metricsConfig.Filters = payloadConfig.Metrics.IncludeList
-	}
-	return &TelemetryConfig{
-		Endpoint:      payloadConfig.Endpoint,
-		Labels:        payloadConfig.Labels,
-		MetricsConfig: &metricsConfig,
-	}, nil
+	return clusterFromHCP(resp.Payload), nil
 }
 
-// Enabled verifies if telemetry is enabled by ensuring a valid endpoint has been retrieved.
-// It returns full metrics endpoint and true if a valid endpoint was obtained.
-func (t *TelemetryConfig) Enabled() (string, bool) {
-	endpoint := t.Endpoint
-	if override := t.MetricsConfig.Endpoint; override != "" {
-		endpoint = override
+func clusterFromHCP(payload *gnmmod.HashicorpCloudGlobalNetworkManager20220215GetClusterResponse) *Cluster {
+	return &Cluster{
+		Name:         payload.Cluster.ID,
+		AccessLevel:  payload.Cluster.ConsulAccessLevel,
+		HCPPortalURL: payload.Cluster.HcpPortalURL,
 	}
-
-	if endpoint == "" {
-		return "", false
-	}
-
-	// The endpoint from Telemetry Gateway is a domain without scheme, and without the metrics path, so they must be added.
-	return endpoint + metricsGatewayPath, true
 }
 
-// DefaultLabels returns a set of <key, value> string pairs that must be added as attributes to all exported telemetry data.
-func (t *TelemetryConfig) DefaultLabels(nodeID string) map[string]string {
-	labels := map[string]string{
-		"node_id": nodeID, // used to delineate Consul nodes in graphs
+func decodeError(err error) error {
+	// Determine the code from the type of error
+	var code int
+	switch e := err.(type) {
+	case *url.Error:
+		oauthErr, ok := errors.Unwrap(e.Err).(*oauth2.RetrieveError)
+		if ok {
+			code = oauthErr.Response.StatusCode
+		}
+	case *hcpgnm.AgentBootstrapConfigDefault:
+		code = e.Code()
+	case *hcpgnm.GetClusterDefault:
+		code = e.Code()
 	}
 
-	for k, v := range t.Labels {
-		labels[k] = v
+	// Return specific error for codes if relevant
+	switch code {
+	case http.StatusUnauthorized:
+		return ErrUnauthorized
+	case http.StatusForbidden:
+		return ErrForbidden
 	}
 
-	return labels
+	return err
+}
+
+func (c *hcpClient) GetObservabilitySecret(ctx context.Context) (string, string, error) {
+	params := hcpgnm.NewGetObservabilitySecretParamsWithContext(ctx).
+		WithID(c.resource.ID).
+		WithLocationOrganizationID(c.resource.Organization).
+		WithLocationProjectID(c.resource.Project)
+
+	resp, err := c.gnm.GetObservabilitySecret(params, nil)
+	if err != nil {
+		return "", "", err
+	}
+
+	if len(resp.GetPayload().Keys) == 0 {
+		return "", "", fmt.Errorf("no observability keys returned for cluster")
+	}
+
+	key := resp.GetPayload().Keys[len(resp.GetPayload().Keys)-1]
+	return key.ClientID, key.ClientSecret, nil
 }

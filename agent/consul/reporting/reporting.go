@@ -1,5 +1,5 @@
 // Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: BUSL-1.1
 
 package reporting
 
@@ -36,7 +36,7 @@ type ServerDelegate interface {
 
 type StateDelegate interface {
 	NodeUsage() (uint64, state.NodeUsage, error)
-	ServiceUsage(ws memdb.WatchSet) (uint64, structs.ServiceUsage, error)
+	ServiceUsage(ws memdb.WatchSet, tenantUsage bool) (uint64, structs.ServiceUsage, error)
 }
 
 func NewReportingManager(logger hclog.Logger, deps EntDeps, server ServerDelegate, stateProvider StateDelegate) *ReportingManager {
